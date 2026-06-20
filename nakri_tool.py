@@ -6,18 +6,22 @@ Tools:
     1. naukri_login          — opens browser, logs in, saves auth state to disk
     2. naukri_search         — loads saved state, searches jobs with filters
     3. naukri_update_resume  — loads saved state, goes to profile, uploads resume PDF
+    4. naukri_apply_jobs     — visits job URLs, applies, delegates chatbot Q&A to
+                                naukri_chatbot_filler.answer_chatbot() (LLM-driven)
 
 Project layout expected:
     naukri_agent/
-    ├── nakri_tool.py          ← this file
+    ├── nakri_tool.py              ← this file
+    ├── naukri_chatbot_filler.py   ← standalone, LLM-driven form filler
+    ├── chatbot_debug.log          ← auto-created Q&A transcript
     ├── .env
     ├── browser_state/
-    │   └── auth.json          ← written by naukri_login (auto-created)
+    │   └── auth.json              ← written by naukri_login (auto-created)
     └── resumes/
         └── Parmanand_Resume.pdf   ← your resume PDF
 
 Install deps:
-    pip install langgraph langchain-core langchain-openai playwright python-dotenv --break-system-packages
+    pip install langgraph langchain-core langchain-openai openai playwright python-dotenv --break-system-packages
     playwright install chromium
 
 Set env vars in .env:
@@ -42,6 +46,11 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from playwright.async_api import async_playwright
 
+# ── Separated chatbot form-filler — see naukri_chatbot_filler.py.
+#    Kept out of this file so it can be debugged/tested against a single
+#    job URL without running search/apply/login first. ────────────────────────
+from naukri_chatbot_filler import answer_chatbot
+
 load_dotenv()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -60,7 +69,7 @@ class AgentState(TypedDict):
 
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = SystemMessage(content="""ou are a Naukri.com automation agent.
+SYSTEM_PROMPT = SystemMessage(content="""You are a Naukri.com automation agent.
 
 STRICT RULES — follow exactly:
 1. Call tools ONE AT A TIME. Never batch or emit multiple tool calls in a single response.
@@ -358,8 +367,11 @@ async def naukri_update_resume(resume_filename: str = "") -> str:
         finally:
             await context.close()
             await browser.close()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TOOL 4 — Apply to jobs with match score filtering
+#          (chatbot Q&A delegated to naukri_chatbot_filler.answer_chatbot)
 # ═════════════════════════════════════════════════════════════════════════════
 @tool
 async def naukri_apply_jobs(
@@ -370,10 +382,12 @@ async def naukri_apply_jobs(
     """
     Visit each Naukri job URL, check the Job Match Score badges,
     and apply if criteria are met. Skips jobs with 'Apply on company site'.
+    If the post-Apply chatbot opens, delegates Q&A to answer_chatbot()
+    (LLM-driven, see naukri_chatbot_filler.py).
     Parameters:
-        job_urls              — Comma-separated list of Naukri job URLs to process
-        require_keyskills     — Skip job if Keyskills badge missing (default: True)
-        require_work_experience — Skip job if Work Experience badge missing (default: True)
+        job_urls                 — Comma-separated list of Naukri job URLs to process
+        require_keyskills        — Skip job if Keyskills badge missing (default: True)
+        require_work_experience  — Skip job if Work Experience badge missing (default: True)
     Returns a summary of applied / skipped jobs.
     Requires a valid session (call check_session first).
     """
@@ -384,24 +398,6 @@ async def naukri_apply_jobs(
         return "❌ No job_urls provided. Pass comma-separated Naukri job URLs."
 
     urls = [u.strip() for u in job_urls.split(",") if u.strip()]
-
-    ANSWER_MAP = {
-        "education": "B.Tech/B.E.",
-        "experience": "4",
-        "notice period": "Immediately",
-        "current ctc": "8",
-        "expected ctc": "12",
-        "location": "Pune",
-        "relocate": "Yes",
-        "python": "Yes",
-        "machine learning": "Yes",
-        "llm": "Yes",
-        "langchain": "Yes",
-        "rag": "Yes",
-        "generative ai": "Yes",
-        "genai": "Yes",
-        "sql": "Yes",
-    }
 
     results = {"applied": [], "skipped": [], "errors": []}
 
@@ -415,7 +411,6 @@ async def naukri_apply_jobs(
             print(f"Processing: {url}")
             try:
                 await page.goto(url, timeout=60_000)
-                # await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(1.5)
 
                 # ── Step 1: Check for "Apply on company site" ─────────────────
@@ -446,7 +441,6 @@ async def naukri_apply_jobs(
 
                 has_keyskills = any("keyskill" in b.lower() for b in badge_texts)
                 has_work_exp = any("work experience" in b.lower() or "experience" in b.lower() for b in badge_texts)
-                has_early = any("early" in b.lower() for b in badge_texts)
 
                 # ── Step 3: Apply decision ────────────────────────────────────
                 skip_reason = None
@@ -483,17 +477,22 @@ async def naukri_apply_jobs(
                         state="visible", timeout=6000
                     )
                     chatbot_opened = True
-                    print("  💬 Chatbot opened — answering questions")
-                except:
+                    print("  💬 Chatbot opened — delegating to answer_chatbot()")
+                except Exception:
                     pass  # No chatbot = direct apply, that's fine
 
+                chat_summary = {"answered": [], "failed": []}
                 if chatbot_opened:
-                    await _answer_chatbot(page, ANSWER_MAP)
+                    chat_summary = await answer_chatbot(page)
+                    if chat_summary["failed"]:
+                        print(f"  ⚠ Chatbot incomplete: {chat_summary['failed']}")
 
                 results["applied"].append({
                     "url": url,
                     "badges": badge_texts,
-                    "chatbot": chatbot_opened
+                    "chatbot": chatbot_opened,
+                    "chatbot_answered": len(chat_summary["answered"]),
+                    "chatbot_failed": len(chat_summary["failed"]),
                 })
                 print(f"  ✅ APPLIED")
                 await asyncio.sleep(2)
@@ -501,7 +500,7 @@ async def naukri_apply_jobs(
             except Exception as e:
                 print(f"  ❌ Error: {e}")
                 results["errors"].append({"url": url, "error": str(e)})
-                await page.screenshot(path=str(BASE_DIR / f"debug_apply_error.png"))
+                await page.screenshot(path=str(BASE_DIR / "debug_apply_error.png"))
 
         await context.close()
         await browser.close()
@@ -515,7 +514,8 @@ async def naukri_apply_jobs(
     )
     if results["applied"]:
         summary += "Applied to:\n" + "\n".join(
-            f"  • {r['url']} (chatbot={r['chatbot']})" for r in results["applied"]
+            f"  • {r['url']} (chatbot={r['chatbot']}, answered={r['chatbot_answered']}, failed={r['chatbot_failed']})"
+            for r in results["applied"]
         ) + "\n\n"
     if results["skipped"]:
         summary += "Skipped:\n" + "\n".join(
@@ -526,93 +526,6 @@ async def naukri_apply_jobs(
             f"  • {r['url']} — {r['error']}" for r in results["errors"]
         )
     return summary
-
-
-async def _answer_chatbot(page, ANSWER_MAP: dict):
-    """Internal helper — walks through Naukri chatbot Q&A"""
-    for i in range(20):
-        await asyncio.sleep(1.5)
-
-        q_els = await page.query_selector_all(
-            "#_4kyut3askMessages [class*='question'], "
-            "#_4kyut3askMessages [class*='Question']"
-        )
-        if not q_els:
-            break
-
-        q_text = (await q_els[-1].inner_text()).lower().strip()
-        print(f"    Q{i+1}: {q_text[:80]}")
-
-        select_el = await page.query_selector(
-            "#sendMsgbtn_container__4kyut3askInputBox select"
-        )
-        option_els = await page.query_selector_all(
-            "#_4kyut3askMessages [class*='chatbot_option'], "
-            "#_4kyut3askMessages [class*='Option']:not([class*='container'])"
-        )
-        input_el = await page.query_selector(
-            "#sendMsgbtn_container__4kyut3askInputBox input[type='text'], "
-            "#sendMsgbtn_container__4kyut3askInputBox textarea"
-        )
-
-        answered = False
-
-        if select_el:
-            options = await select_el.query_selector_all("option")
-            chosen = None
-            for key, val in ANSWER_MAP.items():
-                if key in q_text:
-                    for opt in options:
-                        if val.lower() in (await opt.inner_text()).lower():
-                            chosen = await opt.get_attribute("value")
-                            break
-                    break
-            if not chosen:
-                vals = [await o.get_attribute("value") for o in options if await o.get_attribute("value")]
-                chosen = vals[0] if vals else None
-            if chosen:
-                await select_el.select_option(value=chosen)
-            answered = True
-
-        elif option_els:
-            chosen_el = None
-            for key, val in ANSWER_MAP.items():
-                if key in q_text:
-                    for opt_el in option_els:
-                        if val.lower() in (await opt_el.inner_text()).lower():
-                            chosen_el = opt_el
-                            break
-                    break
-            await (chosen_el or option_els[0]).click()
-            answered = True
-
-        elif input_el:
-            answer = "4"
-            for key, val in ANSWER_MAP.items():
-                if key in q_text:
-                    answer = val
-                    break
-            await input_el.fill(answer)
-            answered = True
-
-        if not answered:
-            print(f"    ⚠ Could not answer: {q_text[:60]}")
-            break
-
-        send_btn = await page.query_selector(
-            "#sendMsgbtn_container__4kyut3askInputBox button[type='submit'], "
-            "#sendMsgbtn_container__4kyut3askInputBox button:has-text('Send'), "
-            "#_4kyut3askChatbotContainer button:has-text('Save')"
-        )
-        if send_btn:
-            await send_btn.click()
-            print(f"    ✅ Answered Q{i+1}")
-
-        # Chatbot closed = submitted
-        drawer = await page.query_selector("#_4kyut3askChatbotContainer")
-        if not drawer or not await drawer.is_visible():
-            print("    ✅ Chatbot closed — application submitted")
-            break
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -649,6 +562,6 @@ async def run_query(query: str) -> str:
 if __name__ == "__main__":
     import sys
     query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "Search jobs for AI ML Engineer or Genai engineer last 1 day, get 10 results, then apply to all of them using naukri_apply_jobs with the URLs"
+        "Update resume on naukri"
     )
     print(asyncio.run(run_query(query)))

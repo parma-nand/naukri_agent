@@ -1,0 +1,78 @@
+{
+  "info": {
+    "name": "FastAPI Sync/Async/Middleware Demo",
+    "description": "Test sync vs async endpoints and middleware behavior. Base URL: http://127.0.0.1:8000",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8000" }
+  ],
+  "item": [
+    {
+      "name": "Root - list endpoints",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/"
+      }
+    },
+    {
+      "name": "Sync - Fast",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/sync/fast"
+      }
+    },
+    {
+      "name": "Sync - Slow (3s, threadpool)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/sync/slow"
+      }
+    },
+    {
+      "name": "Async - Fast",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/async/fast"
+      }
+    },
+    {
+      "name": "Async - Slow (3s, non-blocking)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/async/slow"
+      }
+    },
+    {
+      "name": "Async - BAD blocking (anti-pattern)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/async/bad-blocking"
+      }
+    },
+    {
+      "name": "Secure - No API Key (expect 401)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/secure/data"
+      }
+    },
+    {
+      "name": "Secure - With API Key (expect 200)",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/secure/data",
+        "header": [
+          { "key": "X-API-Key", "value": "secret123" }
+        ]
+      }
+    },
+    {
+      "name": "Whoami - shows request id from middleware",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/whoami"
+      }
+    }
+  ]
+}
